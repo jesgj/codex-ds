@@ -79,3 +79,48 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
+
+## Running DeepSeek V4 Flash
+
+This fork bundles DeepSeek V4 Flash support: a `deepseek` model provider
+(together with the OpenRouter and OpenCode Zen/Go gateways), the
+`deepseek-v4-flash` model preset (1M context window, reasoning levels, freeform
+`apply_patch`), and tolerance for Responses implementations that stream a
+reduced event set (the OpenCode Zen free tier omits `output_item.added`/`done`
+events; Codex now synthesizes them).
+
+Pick one route, set the matching environment variable, then run `codex`:
+
+### Direct DeepSeek API
+
+```shell
+export DEEPSEEK_API_KEY="sk-..."  # https://platform.deepseek.com
+codex --model-provider deepseek --model deepseek-v4-flash
+```
+
+### OpenRouter
+
+```shell
+export OPENROUTER_API_KEY="sk-or-..."  # https://openrouter.ai/keys
+codex --model-provider openrouter --model deepseek/deepseek-v4-flash
+```
+
+### OpenCode Zen / Go
+
+```shell
+export OPENCODE_ZEN_API_KEY="sk-..."  # https://opencode.ai/auth
+codex --model-provider opencode --model deepseek-v4-flash
+```
+
+The OpenCode Zen free tier also serves `deepseek-v4-flash-free`:
+
+```shell
+codex --model-provider opencode --model deepseek-v4-flash-free
+```
+
+Or persist the choice in `~/.codex/config.toml`:
+
+```toml
+model_provider = "deepseek"
+model = "deepseek-v4-flash"
+```

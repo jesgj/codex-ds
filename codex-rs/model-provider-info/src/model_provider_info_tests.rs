@@ -512,7 +512,10 @@ fn test_built_in_deepseek_provider() {
         .expect("deepseek provider should be built in");
 
     assert_eq!(deepseek.name, "DeepSeek");
-    assert_eq!(deepseek.base_url.as_deref(), Some("https://api.deepseek.com"));
+    assert_eq!(
+        deepseek.base_url.as_deref(),
+        Some("https://api.deepseek.com")
+    );
     assert_eq!(deepseek.env_key.as_deref(), Some("DEEPSEEK_API_KEY"));
     assert_eq!(deepseek.wire_api, WireApi::Responses);
     assert!(!deepseek.requires_openai_auth);

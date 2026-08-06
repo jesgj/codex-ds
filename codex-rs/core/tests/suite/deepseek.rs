@@ -93,7 +93,11 @@ async fn deepseek_lite_text_stream_completes_turn() {
     test.submit_text_turn("hello").await.expect("submit turn");
 
     assert_eq!(resp_mock.requests().len(), 1);
-    let request = resp_mock.requests().into_iter().next().expect("one request");
+    let request = resp_mock
+        .requests()
+        .into_iter()
+        .next()
+        .expect("one request");
     assert_eq!(request.path(), "/v1/responses");
     assert_eq!(request.body_json()["model"], "deepseek-v4-flash");
 }
@@ -134,10 +138,16 @@ async fn deepseek_lite_stream_executes_tool_call_and_keeps_history() {
         .await
         .expect("create new conversation");
 
-    test.submit_text_turn("run a command").await.expect("submit turn");
+    test.submit_text_turn("run a command")
+        .await
+        .expect("submit turn");
 
     let requests = resp_mock.requests();
-    assert_eq!(requests.len(), 2, "tool call should trigger a follow-up request");
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool call should trigger a follow-up request"
+    );
 
     // The synthesized function_call item must have carried the accumulated
     // arguments, so the shell tool was dispatched and its output came back in

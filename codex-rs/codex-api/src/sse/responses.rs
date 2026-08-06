@@ -378,8 +378,8 @@ impl OutputItemAssembler {
     fn before(&mut self, raw: &ResponsesStreamEvent) -> Vec<ResponseEvent> {
         let mut events = Vec::new();
         match raw.kind.as_str() {
-            "response.output_text.delta" => {
-                if self.pending_message_index().is_none() {
+            "response.output_text.delta"
+                if self.pending_message_index().is_none() => {
                     let item = ResponseItem::Message {
                         id: None,
                         role: "assistant".to_string(),
@@ -389,11 +389,10 @@ impl OutputItemAssembler {
                     };
                     self.register_synthesized(item, &mut events);
                 }
-            }
             "response.reasoning_text.delta"
             | "response.reasoning_summary_text.delta"
-            | "response.reasoning_summary_part.added" => {
-                if !self.pending_has_reasoning() {
+            | "response.reasoning_summary_part.added"
+                if !self.pending_has_reasoning() => {
                     let item = ResponseItem::Reasoning {
                         id: None,
                         summary: Vec::new(),
@@ -403,7 +402,6 @@ impl OutputItemAssembler {
                     };
                     self.register_synthesized(item, &mut events);
                 }
-            }
             "response.output_item.added" | "response.output_item.done" => {
                 self.flush_synthesized(&mut events);
             }
@@ -425,11 +423,10 @@ impl OutputItemAssembler {
             return Vec::new();
         };
         match event {
-            ResponseEvent::OutputItemAdded(item) => {
-                if !self.is_registered(item) {
+            ResponseEvent::OutputItemAdded(item)
+                if !self.is_registered(item) => {
                     self.register_server(output_index, item.clone());
                 }
-            }
             ResponseEvent::OutputItemDone(item) => {
                 self.remove(output_index, item);
             }
@@ -479,9 +476,9 @@ impl OutputItemAssembler {
         if self.pending.len() >= MAX_PENDING_OUTPUT_ITEMS {
             return;
         }
-        let index = output_index.map(|i| i.max(0) as usize).unwrap_or_else(|| {
-            usize::MAX - self.next_synthesized_index
-        });
+        let index = output_index
+            .map(|i| i.max(0) as usize)
+            .unwrap_or_else(|| usize::MAX - self.next_synthesized_index);
         if self.index_to_position.contains_key(&index) {
             return;
         }
@@ -526,10 +523,9 @@ impl OutputItemAssembler {
     }
 
     fn pending_message_index(&self) -> Option<usize> {
-        self.pending
-            .iter()
-            .rev()
-            .find_map(|(index, item)| matches!(item, ResponseItem::Message { .. }).then_some(*index))
+        self.pending.iter().rev().find_map(|(index, item)| {
+            matches!(item, ResponseItem::Message { .. }).then_some(*index)
+        })
     }
 
     fn pending_reasoning_index(&self) -> Option<usize> {
@@ -643,7 +639,9 @@ impl OutputItemAssembler {
                 };
                 self.append_call_input(index, delta);
             }
-            "response.custom_tool_call_input.delta" if raw.item_id.is_none() && raw.call_id.is_none() => {
+            "response.custom_tool_call_input.delta"
+                if raw.item_id.is_none() && raw.call_id.is_none() =>
+            {
                 let Some(delta) = raw.delta.as_deref() else {
                     return;
                 };
@@ -2178,7 +2176,9 @@ mod tests {
             panic!("expected synthesized reasoning done");
         };
         assert_eq!(
-            content.as_ref().expect("reasoning content should be present"),
+            content
+                .as_ref()
+                .expect("reasoning content should be present"),
             &[ReasoningItemContent::ReasoningText {
                 text: "thinking".to_string()
             }]
