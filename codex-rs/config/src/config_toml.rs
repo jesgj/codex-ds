@@ -36,6 +36,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_model_provider_info::OPENCODE_GO_PROVIDER_ID;
 use codex_model_provider_info::OPENCODE_PROVIDER_ID;
 use codex_model_provider_info::OPENROUTER_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -61,7 +62,7 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 7] = [
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 8] = [
     AMAZON_BEDROCK_PROVIDER_ID,
     OPENAI_PROVIDER_ID,
     OLLAMA_OSS_PROVIDER_ID,
@@ -69,6 +70,7 @@ const RESERVED_MODEL_PROVIDER_IDS: [&str; 7] = [
     DEEPSEEK_PROVIDER_ID,
     OPENROUTER_PROVIDER_ID,
     OPENCODE_PROVIDER_ID,
+    OPENCODE_GO_PROVIDER_ID,
 ];
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;

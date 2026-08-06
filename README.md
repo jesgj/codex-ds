@@ -105,7 +105,7 @@ export OPENROUTER_API_KEY="sk-or-..."  # https://openrouter.ai/keys
 codex --model-provider openrouter --model deepseek/deepseek-v4-flash
 ```
 
-### OpenCode Zen / Go
+### OpenCode Zen
 
 ```shell
 export OPENCODE_ZEN_API_KEY="sk-..."  # https://opencode.ai/auth
@@ -116,6 +116,13 @@ The OpenCode Zen free tier also serves `deepseek-v4-flash-free`:
 
 ```shell
 codex --model-provider opencode --model deepseek-v4-flash-free
+```
+
+### OpenCode Go (subscription)
+
+```shell
+export OPENCODE_GO_API_KEY="sk-..."  # https://opencode.ai/auth
+codex --model-provider opencode-go --model deepseek-v4-flash
 ```
 
 Or persist the choice in `~/.codex/config.toml`:

@@ -433,12 +433,15 @@ pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
 /// Built-in provider for the OpenRouter gateway.
 pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
-/// Built-in provider for the OpenCode Zen/Go gateway.
+/// Built-in provider for the OpenCode Zen gateway.
 pub const OPENCODE_PROVIDER_ID: &str = "opencode";
+/// Built-in provider for the OpenCode Go subscription gateway.
+pub const OPENCODE_GO_PROVIDER_ID: &str = "opencode-go";
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
+const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 /// Built-in default provider list.
 pub fn built_in_model_providers(
@@ -466,6 +469,7 @@ pub fn built_in_model_providers(
         (DEEPSEEK_PROVIDER_ID, create_deepseek_provider()),
         (OPENROUTER_PROVIDER_ID, create_openrouter_provider()),
         (OPENCODE_PROVIDER_ID, create_opencode_provider()),
+        (OPENCODE_GO_PROVIDER_ID, create_opencode_go_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -498,13 +502,25 @@ pub fn create_openrouter_provider() -> ModelProviderInfo {
     }
 }
 
-/// Built-in OpenCode Zen/Go gateway provider. Serves `deepseek-v4-flash` and
+/// Built-in OpenCode Zen gateway provider. Serves `deepseek-v4-flash` and
 /// the free `deepseek-v4-flash-free` model over the Responses API.
 pub fn create_opencode_provider() -> ModelProviderInfo {
     ModelProviderInfo {
-        name: "OpenCode".into(),
+        name: "OpenCode Zen".into(),
         base_url: Some(OPENCODE_BASE_URL.into()),
         env_key: Some("OPENCODE_ZEN_API_KEY".into()),
+        env_key_instructions: Some("Get an API key at https://opencode.ai/auth".to_string()),
+        ..ModelProviderInfo::default()
+    }
+}
+
+/// Built-in OpenCode Go gateway provider. Serves `deepseek-v4-flash` (and
+/// `deepseek-v4-pro`) to Go subscribers over the Responses API.
+pub fn create_opencode_go_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "OpenCode Go".into(),
+        base_url: Some(OPENCODE_GO_BASE_URL.into()),
+        env_key: Some("OPENCODE_GO_API_KEY".into()),
         env_key_instructions: Some("Get an API key at https://opencode.ai/auth".to_string()),
         ..ModelProviderInfo::default()
     }

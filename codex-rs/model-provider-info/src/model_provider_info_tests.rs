@@ -548,7 +548,7 @@ fn test_built_in_opencode_provider() {
         .get(OPENCODE_PROVIDER_ID)
         .expect("opencode provider should be built in");
 
-    assert_eq!(opencode.name, "OpenCode");
+    assert_eq!(opencode.name, "OpenCode Zen");
     assert_eq!(
         opencode.base_url.as_deref(),
         Some("https://opencode.ai/zen/v1")
@@ -557,6 +557,24 @@ fn test_built_in_opencode_provider() {
     assert_eq!(opencode.wire_api, WireApi::Responses);
     assert!(!opencode.requires_openai_auth);
     assert!(opencode.validate().is_ok());
+}
+
+#[test]
+fn test_built_in_opencode_go_provider() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let opencode_go = providers
+        .get(OPENCODE_GO_PROVIDER_ID)
+        .expect("opencode-go provider should be built in");
+
+    assert_eq!(opencode_go.name, "OpenCode Go");
+    assert_eq!(
+        opencode_go.base_url.as_deref(),
+        Some("https://opencode.ai/zen/go/v1")
+    );
+    assert_eq!(opencode_go.env_key.as_deref(), Some("OPENCODE_GO_API_KEY"));
+    assert_eq!(opencode_go.wire_api, WireApi::Responses);
+    assert!(!opencode_go.requires_openai_auth);
+    assert!(opencode_go.validate().is_ok());
 }
 
 #[test]
