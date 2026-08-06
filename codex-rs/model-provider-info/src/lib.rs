@@ -429,6 +429,17 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
 pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
 
+/// Built-in provider for the DeepSeek API.
+pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
+/// Built-in provider for the OpenRouter gateway.
+pub const OPENROUTER_PROVIDER_ID: &str = "openrouter";
+/// Built-in provider for the OpenCode Zen/Go gateway.
+pub const OPENCODE_PROVIDER_ID: &str = "opencode";
+
+const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const OPENCODE_BASE_URL: &str = "https://opencode.ai/zen/v1";
+
 /// Built-in default provider list.
 pub fn built_in_model_providers(
     openai_base_url: Option<String>,
@@ -437,10 +448,10 @@ pub fn built_in_model_providers(
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
 
-    // We do not want to be in the business of adjucating which third-party
-    // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // This fork bundles DeepSeek and the gateways that serve DeepSeek models
+    // (OpenRouter, OpenCode Zen/Go) so that `deepseek-v4-flash` works out of
+    // the box. Users can still override or extend providers via `model_providers`
+    // in config.toml.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
@@ -452,10 +463,51 @@ pub fn built_in_model_providers(
             LMSTUDIO_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_LMSTUDIO_PORT, WireApi::Responses),
         ),
+        (DEEPSEEK_PROVIDER_ID, create_deepseek_provider()),
+        (OPENROUTER_PROVIDER_ID, create_openrouter_provider()),
+        (OPENCODE_PROVIDER_ID, create_opencode_provider()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect()
+}
+
+/// Built-in DeepSeek provider. Serves `deepseek-v4-flash` over the Responses API.
+pub fn create_deepseek_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "DeepSeek".into(),
+        base_url: Some(DEEPSEEK_BASE_URL.into()),
+        env_key: Some("DEEPSEEK_API_KEY".into()),
+        env_key_instructions: Some(
+            "Get an API key from the DeepSeek platform at https://platform.deepseek.com"
+                .to_string(),
+        ),
+        ..ModelProviderInfo::default()
+    }
+}
+
+/// Built-in OpenRouter gateway provider. Serves DeepSeek models as
+/// `deepseek/deepseek-v4-flash` over the Responses API.
+pub fn create_openrouter_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "OpenRouter".into(),
+        base_url: Some(OPENROUTER_BASE_URL.into()),
+        env_key: Some("OPENROUTER_API_KEY".into()),
+        env_key_instructions: Some("Get an API key at https://openrouter.ai/keys".to_string()),
+        ..ModelProviderInfo::default()
+    }
+}
+
+/// Built-in OpenCode Zen/Go gateway provider. Serves `deepseek-v4-flash` and
+/// the free `deepseek-v4-flash-free` model over the Responses API.
+pub fn create_opencode_provider() -> ModelProviderInfo {
+    ModelProviderInfo {
+        name: "OpenCode".into(),
+        base_url: Some(OPENCODE_BASE_URL.into()),
+        env_key: Some("OPENCODE_ZEN_API_KEY".into()),
+        env_key_instructions: Some("Get an API key at https://opencode.ai/auth".to_string()),
+        ..ModelProviderInfo::default()
+    }
 }
 
 /// Merge configured providers into the built-in provider catalog.

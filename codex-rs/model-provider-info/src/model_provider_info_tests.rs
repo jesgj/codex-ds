@@ -503,3 +503,67 @@ refresh_interval_ms = 0
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
 }
+
+#[test]
+fn test_built_in_deepseek_provider() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let deepseek = providers
+        .get(DEEPSEEK_PROVIDER_ID)
+        .expect("deepseek provider should be built in");
+
+    assert_eq!(deepseek.name, "DeepSeek");
+    assert_eq!(deepseek.base_url.as_deref(), Some("https://api.deepseek.com"));
+    assert_eq!(deepseek.env_key.as_deref(), Some("DEEPSEEK_API_KEY"));
+    assert_eq!(deepseek.wire_api, WireApi::Responses);
+    assert!(!deepseek.requires_openai_auth);
+    assert!(!deepseek.supports_websockets);
+    assert!(deepseek.validate().is_ok());
+}
+
+#[test]
+fn test_built_in_openrouter_provider() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let openrouter = providers
+        .get(OPENROUTER_PROVIDER_ID)
+        .expect("openrouter provider should be built in");
+
+    assert_eq!(openrouter.name, "OpenRouter");
+    assert_eq!(
+        openrouter.base_url.as_deref(),
+        Some("https://openrouter.ai/api/v1")
+    );
+    assert_eq!(openrouter.env_key.as_deref(), Some("OPENROUTER_API_KEY"));
+    assert_eq!(openrouter.wire_api, WireApi::Responses);
+    assert!(!openrouter.requires_openai_auth);
+    assert!(openrouter.validate().is_ok());
+}
+
+#[test]
+fn test_built_in_opencode_provider() {
+    let providers = built_in_model_providers(/*openai_base_url*/ None);
+    let opencode = providers
+        .get(OPENCODE_PROVIDER_ID)
+        .expect("opencode provider should be built in");
+
+    assert_eq!(opencode.name, "OpenCode");
+    assert_eq!(
+        opencode.base_url.as_deref(),
+        Some("https://opencode.ai/zen/v1")
+    );
+    assert_eq!(opencode.env_key.as_deref(), Some("OPENCODE_ZEN_API_KEY"));
+    assert_eq!(opencode.wire_api, WireApi::Responses);
+    assert!(!opencode.requires_openai_auth);
+    assert!(opencode.validate().is_ok());
+}
+
+#[test]
+fn test_built_in_deepseek_provider_creates_responses_api_provider() {
+    let provider = create_deepseek_provider();
+    let api_provider = provider
+        .to_api_provider(/*auth_mode*/ None)
+        .expect("provider should convert to API provider");
+
+    // Codex appends `/responses` to the base URL, so the provider must point
+    // at the DeepSeek host root.
+    assert_eq!(api_provider.base_url, "https://api.deepseek.com");
+}

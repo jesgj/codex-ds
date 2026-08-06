@@ -8,6 +8,8 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
@@ -16,6 +18,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -174,6 +177,7 @@ pub struct ResponsesStreamEvent {
     text: Option<String>,
     summary_index: Option<i64>,
     content_index: Option<i64>,
+    output_index: Option<i64>,
     safety_buffering: Option<Value>,
 }
 
@@ -323,6 +327,332 @@ impl ResponsesEventError {
     pub fn into_api_error(self) -> ApiError {
         match self {
             Self::Api(error) => error,
+        }
+    }
+}
+
+/// Maximum number of concurrently pending output items tracked by the
+/// assembler, as a safety cap against unbounded memory from malformed streams.
+const MAX_PENDING_OUTPUT_ITEMS: usize = 64;
+
+/// Self-healing output-item assembly for Responses streams that omit
+/// `response.output_item.added` / `response.output_item.done` events.
+///
+/// Some Responses implementations (for example the OpenCode Zen gateway's
+/// free-tier upstream) stream `response.output_text.delta`,
+/// `response.function_call_arguments.delta` and `response.completed` without
+/// ever opening or closing output items. Codex's turn loop requires item
+/// events, so this assembler synthesizes the missing ones:
+///
+/// - A `response.output_text.delta` without a pending message item synthesizes
+///   `response.output_item.added` for an assistant message and accumulates the
+///   text deltas into it.
+/// - Reasoning deltas (`response.reasoning_text.delta` and friends) synthesize
+///   a reasoning item the same way.
+/// - `response.function_call_arguments.delta` / `response.custom_tool_call_input.delta`
+///   accumulate arguments into the matching pending call item.
+/// - `response.completed` flushes every still-pending item as
+///   `response.output_item.done`.
+///
+/// Streams that emit the full event set are unaffected: the assembler only
+/// fires when events are missing.
+#[derive(Debug, Default)]
+pub(crate) struct OutputItemAssembler {
+    /// Items not yet closed by `response.output_item.done`, in output order.
+    pending: Vec<(usize, ResponseItem)>,
+    /// `output_index` -> position in `pending` for delta routing.
+    index_to_position: HashMap<usize, usize>,
+    /// output_indexes in `pending` that this assembler synthesized.
+    synthesized: Vec<usize>,
+    /// Next `output_index` to hand to synthesized items.
+    next_synthesized_index: usize,
+}
+
+impl OutputItemAssembler {
+    /// Returns events that must be emitted before `raw` is forwarded.
+    ///
+    /// This synthesizes missing `response.output_item.added` events for delta
+    /// events, and closes synthesized items as soon as the server emits its own
+    /// `response.output_item.added` / `.done` (a server's item boundaries are
+    /// authoritative, so any text/reasoning that preceded them is complete).
+    fn before(&mut self, raw: &ResponsesStreamEvent) -> Vec<ResponseEvent> {
+        let mut events = Vec::new();
+        match raw.kind.as_str() {
+            "response.output_text.delta" => {
+                if self.pending_message_index().is_none() {
+                    let item = ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: Vec::new(),
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    };
+                    self.register_synthesized(item, &mut events);
+                }
+            }
+            "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_part.added" => {
+                if !self.pending_has_reasoning() {
+                    let item = ResponseItem::Reasoning {
+                        id: None,
+                        summary: Vec::new(),
+                        content: Some(Vec::new()),
+                        encrypted_content: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    };
+                    self.register_synthesized(item, &mut events);
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                self.flush_synthesized(&mut events);
+            }
+            _ => {}
+        }
+        events
+    }
+
+    /// Updates assembler state from the mapped event, returning events that
+    /// must be emitted before the mapped event itself (currently only the
+    /// synthesized `response.output_item.done` flushes at completion).
+    fn after(
+        &mut self,
+        kind: &str,
+        output_index: Option<i64>,
+        mapped: &std::result::Result<Option<ResponseEvent>, ResponsesEventError>,
+    ) -> Vec<ResponseEvent> {
+        let Ok(Some(event)) = mapped else {
+            return Vec::new();
+        };
+        match event {
+            ResponseEvent::OutputItemAdded(item) => {
+                if !self.is_registered(item) {
+                    self.register_server(output_index, item.clone());
+                }
+            }
+            ResponseEvent::OutputItemDone(item) => {
+                self.remove(output_index, item);
+            }
+            ResponseEvent::OutputTextDelta(delta) => {
+                if let Some(index) = self.pending_message_index() {
+                    self.append_message_text(index, delta);
+                }
+            }
+            ResponseEvent::ToolCallInputDelta {
+                item_id,
+                call_id,
+                delta,
+            } => {
+                if let Some(index) = self.pending_call_index(item_id, call_id.as_deref()) {
+                    self.append_call_input(index, delta);
+                }
+            }
+            ResponseEvent::ReasoningSummaryDelta { delta, .. }
+            | ResponseEvent::ReasoningContentDelta { delta, .. } => {
+                if let Some(index) = self.pending_reasoning_index() {
+                    self.append_reasoning_text(index, delta);
+                }
+            }
+            _ => {}
+        }
+
+        if kind == "response.completed" {
+            self.flush_pending()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn register_synthesized(&mut self, item: ResponseItem, events: &mut Vec<ResponseEvent>) {
+        if self.pending.len() >= MAX_PENDING_OUTPUT_ITEMS {
+            return;
+        }
+        let index = usize::MAX - self.next_synthesized_index;
+        self.next_synthesized_index += 1;
+        self.index_to_position.insert(index, self.pending.len());
+        self.pending.push((index, item.clone()));
+        self.synthesized.push(index);
+        events.push(ResponseEvent::OutputItemAdded(item));
+    }
+
+    fn register_server(&mut self, output_index: Option<i64>, item: ResponseItem) {
+        if self.pending.len() >= MAX_PENDING_OUTPUT_ITEMS {
+            return;
+        }
+        let index = output_index.map(|i| i.max(0) as usize).unwrap_or_else(|| {
+            usize::MAX - self.next_synthesized_index
+        });
+        if self.index_to_position.contains_key(&index) {
+            return;
+        }
+        self.index_to_position.insert(index, self.pending.len());
+        self.pending.push((index, item));
+    }
+
+    fn remove(&mut self, output_index: Option<i64>, item: &ResponseItem) {
+        let index = output_index
+            .map(|i| i.max(0) as usize)
+            .or_else(|| self.find_pending_index_by_id(item));
+        let Some(index) = index else {
+            return;
+        };
+        self.remove_at_index(index);
+    }
+
+    fn remove_at_index(&mut self, index: usize) {
+        let Some(position) = self.index_to_position.remove(&index) else {
+            return;
+        };
+        self.pending.remove(position);
+        self.synthesized.retain(|i| *i != index);
+        // Positions after `position` shifted by one.
+        for (_index, stored_position) in self.index_to_position.iter_mut() {
+            if *stored_position > position {
+                *stored_position -= 1;
+            }
+        }
+    }
+
+    fn is_registered(&self, item: &ResponseItem) -> bool {
+        item.id()
+            .is_some_and(|_| self.find_pending_index_by_id(item).is_some())
+    }
+
+    fn find_pending_index_by_id(&self, item: &ResponseItem) -> Option<usize> {
+        let id = item.id()?;
+        self.pending
+            .iter()
+            .find_map(|(index, pending)| (pending.id() == Some(id)).then_some(*index))
+    }
+
+    fn pending_message_index(&self) -> Option<usize> {
+        self.pending
+            .iter()
+            .rev()
+            .find_map(|(index, item)| matches!(item, ResponseItem::Message { .. }).then_some(*index))
+    }
+
+    fn pending_reasoning_index(&self) -> Option<usize> {
+        self.pending.iter().find_map(|(index, item)| {
+            matches!(item, ResponseItem::Reasoning { .. }).then_some(*index)
+        })
+    }
+
+    fn pending_has_reasoning(&self) -> bool {
+        self.pending_reasoning_index().is_some()
+    }
+
+    fn pending_call_index(&self, item_id: &str, call_id: Option<&str>) -> Option<usize> {
+        self.pending.iter().find_map(|(index, item)| {
+            let matches = match item {
+                ResponseItem::FunctionCall {
+                    call_id: item_call_id,
+                    ..
+                } => {
+                    call_id.is_some_and(|id| id == item_call_id)
+                        || item.id().is_some_and(|id| id.as_str() == item_id)
+                }
+                ResponseItem::CustomToolCall {
+                    call_id: item_call_id,
+                    ..
+                } => {
+                    call_id.is_some_and(|id| id == item_call_id)
+                        || item.id().is_some_and(|id| id.as_str() == item_id)
+                }
+                _ => false,
+            };
+            matches.then_some(*index)
+        })
+    }
+
+    fn append_message_text(&mut self, index: usize, delta: &str) {
+        if let Some((_, ResponseItem::Message { content, .. })) =
+            self.pending.iter_mut().find(|(i, _)| *i == index)
+        {
+            match content.last_mut() {
+                Some(ContentItem::OutputText { text }) => text.push_str(delta),
+                _ => content.push(ContentItem::OutputText {
+                    text: delta.to_string(),
+                }),
+            }
+        }
+    }
+
+    fn append_reasoning_text(&mut self, index: usize, delta: &str) {
+        if let Some((_, ResponseItem::Reasoning { content, .. })) =
+            self.pending.iter_mut().find(|(i, _)| *i == index)
+            && let Some(content) = content
+        {
+            content.push(ReasoningItemContent::ReasoningText {
+                text: delta.to_string(),
+            });
+        }
+    }
+
+    fn append_call_input(&mut self, index: usize, delta: &str) {
+        let Some((_, item)) = self.pending.iter_mut().find(|(i, _)| *i == index) else {
+            return;
+        };
+        match item {
+            ResponseItem::FunctionCall { arguments, .. } => arguments.push_str(delta),
+            ResponseItem::CustomToolCall { input, .. } => input.push_str(delta),
+            _ => {}
+        }
+    }
+
+    /// Closes synthesized items (a server item boundary just arrived).
+    fn flush_synthesized(&mut self, events: &mut Vec<ResponseEvent>) {
+        let mut to_remove = Vec::new();
+        for (index, item) in &self.pending {
+            if self.synthesized.contains(index) {
+                to_remove.push(*index);
+                events.push(ResponseEvent::OutputItemDone(item.clone()));
+            }
+        }
+        for index in to_remove {
+            self.remove_at_index(index);
+        }
+    }
+
+    fn flush_pending(&mut self) -> Vec<ResponseEvent> {
+        let items = std::mem::take(&mut self.pending);
+        self.index_to_position.clear();
+        self.synthesized.clear();
+        self.next_synthesized_index = 0;
+        items
+            .into_iter()
+            .map(|(_, item)| ResponseEvent::OutputItemDone(item))
+            .collect()
+    }
+
+    /// Accumulates deltas that the Responses mapper drops.
+    ///
+    /// `response.function_call_arguments.delta` has no mapped event today, and
+    /// `response.custom_tool_call_input.delta` without an item/call id is
+    /// dropped as well. Both still need to land in the pending call item so
+    /// that the synthesized `response.output_item.done` carries the full
+    /// arguments.
+    fn accumulate_raw(&mut self, raw: &ResponsesStreamEvent) {
+        match raw.kind.as_str() {
+            "response.function_call_arguments.delta" => {
+                let Some(delta) = raw.delta.as_deref() else {
+                    return;
+                };
+                let Some(index) = raw.output_index.map(|i| i.max(0) as usize) else {
+                    return;
+                };
+                self.append_call_input(index, delta);
+            }
+            "response.custom_tool_call_input.delta" if raw.item_id.is_none() && raw.call_id.is_none() => {
+                let Some(delta) = raw.delta.as_deref() else {
+                    return;
+                };
+                let Some(index) = raw.output_index.map(|i| i.max(0) as usize) else {
+                    return;
+                };
+                self.append_call_input(index, delta);
+            }
+            _ => {}
         }
     }
 }
@@ -502,6 +832,7 @@ async fn process_sse_with_treatment(
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
+    let mut assembler = OutputItemAssembler::default();
 
     loop {
         let start = Instant::now();
@@ -540,6 +871,16 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
+
+        let mut synthesized_added = assembler.before(&event);
+        for event in synthesized_added.drain(..) {
+            if tx_event.send(Ok(event)).await.is_err() {
+                return;
+            }
+        }
+        assembler.accumulate_raw(&event);
+        let kind = event.kind().to_string();
+        let output_index = event.output_index;
         let model_verifications = event.model_verifications();
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
@@ -581,7 +922,15 @@ async fn process_sse_with_treatment(
             return;
         }
 
-        match process_responses_event(event) {
+        let mapped = process_responses_event(event);
+        let synthesized_done = assembler.after(&kind, output_index, &mapped);
+        for event in synthesized_done {
+            if tx_event.send(Ok(event)).await.is_err() {
+                return;
+            }
+        }
+
+        match mapped {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
                 if tx_event.send(Ok(event)).await.is_err() {
@@ -1472,29 +1821,47 @@ mod tests {
         ])
         .await;
 
-        assert_eq!(events.len(), 7);
+        assert_eq!(events.len(), 9);
         assert_matches!(&events[0], ResponseEvent::Created);
+        // The stream opens a message item implicitly; the assembler synthesizes
+        // the missing response.output_item.added.
         assert_matches!(
             &events[1],
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+        );
+        assert_matches!(
+            &events[2],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"]
                     && buffering.reasons == ["user_risk"]
                     && buffering.show_buffering_ui
                     && buffering.faster_model.as_deref() == Some("gpt-fast-wire")
         );
-        assert_matches!(&events[2], ResponseEvent::OutputTextDelta(delta) if delta == "hello");
+        assert_matches!(&events[3], ResponseEvent::OutputTextDelta(delta) if delta == "hello");
         assert_matches!(
-            &events[3],
+            &events[4],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"] && buffering.reasons == ["user_risk"]
         );
-        assert_matches!(&events[4], ResponseEvent::OutputTextDelta(delta) if delta == " world");
+        assert_matches!(&events[5], ResponseEvent::OutputTextDelta(delta) if delta == " world");
         assert_matches!(
-            &events[5],
+            &events[6],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"] && buffering.reasons == ["user_risk"]
         );
-        assert_matches!(&events[6], ResponseEvent::Completed { response_id, .. } if response_id == "resp-1");
+        // The pending message item closes with the accumulated text at completion.
+        let ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) = &events[7]
+        else {
+            panic!("expected synthesized output_item.done");
+        };
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0],
+            ContentItem::OutputText {
+                text: "hello world".to_string()
+            }
+        );
+        assert_matches!(&events[8], ResponseEvent::Completed { response_id, .. } if response_id == "resp-1");
     }
 
     #[test]
@@ -1660,6 +2027,220 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(35)));
+    }
+
+    #[tokio::test]
+    async fn lite_text_stream_synthesizes_message_item_events() {
+        // OpenCode Zen free-tier style: only output_text.delta + completed,
+        // no response.output_item.added / .done events at all.
+        let events = run_sse(vec![
+            json!({ "type": "response.output_text.delta", "delta": "Hello" }),
+            json!({ "type": "response.output_text.delta", "delta": " world" }),
+            json!({ "type": "response.completed", "response": { "id": "resp1" } }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            &events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { role, .. })
+                if role == "assistant"
+        ));
+        assert!(matches!(
+            &events[1],
+            ResponseEvent::OutputTextDelta(delta) if delta == "Hello"
+        ));
+        assert!(matches!(
+            &events[2],
+            ResponseEvent::OutputTextDelta(delta) if delta == " world"
+        ));
+        let ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) = &events[3]
+        else {
+            panic!("expected synthesized output_item.done with message");
+        };
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0],
+            ContentItem::OutputText {
+                text: "Hello world".to_string()
+            }
+        );
+        assert!(matches!(
+            &events[4],
+            ResponseEvent::Completed { response_id, .. } if response_id == "resp1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn lite_tool_stream_synthesizes_function_call_done_with_arguments() {
+        // OpenCode Zen free-tier style: text deltas, then a function_call added
+        // with empty arguments, argument deltas keyed by output_index, and
+        // completed with no output_item.done.
+        let events = run_sse(vec![
+            json!({ "type": "response.output_text.delta", "delta": "I'll add" }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "call_1",
+                    "call_id": "call_1",
+                    "name": "calculator",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"a\": 1"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": ", \"b\": 2}"
+            }),
+            json!({ "type": "response.completed", "response": { "id": "resp1" } }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 6);
+        // Synthesized message item for the leading text deltas.
+        assert!(matches!(
+            &events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+        ));
+        assert!(matches!(
+            &events[1],
+            ResponseEvent::OutputTextDelta(delta) if delta == "I'll add"
+        ));
+        // The synthesized message closes when the server emits its own item.
+        assert!(matches!(
+            &events[2],
+            ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+        ));
+        assert!(matches!(
+            &events[3],
+            ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall {
+                name, arguments, ..
+            }) if name == "calculator" && arguments.is_empty()
+        ));
+        // The function call closes at completed with accumulated arguments.
+        let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        }) = &events[4]
+        else {
+            panic!("expected synthesized function_call done");
+        };
+        assert_eq!(name, "calculator");
+        assert_eq!(arguments, "{\"a\": 1, \"b\": 2}");
+        assert_eq!(call_id, "call_1");
+        assert!(matches!(
+            &events[5],
+            ResponseEvent::Completed { response_id, .. } if response_id == "resp1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn lite_reasoning_stream_synthesizes_reasoning_item() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.reasoning_text.delta",
+                "content_index": 0,
+                "delta": "thinking"
+            }),
+            json!({ "type": "response.output_text.delta", "delta": "Answer" }),
+            json!({ "type": "response.completed", "response": { "id": "resp1" } }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 7);
+        assert!(matches!(
+            &events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { .. })
+        ));
+        assert!(matches!(
+            &events[1],
+            ResponseEvent::ReasoningContentDelta { delta, .. } if delta == "thinking"
+        ));
+        assert!(matches!(
+            &events[2],
+            ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+        ));
+        assert!(matches!(
+            &events[3],
+            ResponseEvent::OutputTextDelta(delta) if delta == "Answer"
+        ));
+        let ResponseEvent::OutputItemDone(ResponseItem::Reasoning { content, .. }) = &events[4]
+        else {
+            panic!("expected synthesized reasoning done");
+        };
+        assert_eq!(
+            content.as_ref().expect("reasoning content should be present"),
+            &[ReasoningItemContent::ReasoningText {
+                text: "thinking".to_string()
+            }]
+        );
+        assert!(matches!(
+            &events[5],
+            ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+        ));
+        assert!(matches!(
+            &events[6],
+            ResponseEvent::Completed { response_id, .. } if response_id == "resp1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_stream_is_not_modified_by_assembler() {
+        // A server that emits the complete event set must see the exact same
+        // event sequence (no synthesized additions).
+        let events = run_sse(vec![
+            json!({ "type": "response.created", "response": {} }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": []
+                }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "Hi"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hi"}]
+                }
+            }),
+            json!({ "type": "response.completed", "response": { "id": "resp1" } }),
+        ])
+        .await;
+
+        let kinds = events
+            .iter()
+            .map(|event| match event {
+                ResponseEvent::Created => "created",
+                ResponseEvent::OutputItemAdded(_) => "added",
+                ResponseEvent::OutputTextDelta(_) => "delta",
+                ResponseEvent::OutputItemDone(_) => "done",
+                ResponseEvent::Completed { .. } => "completed",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["created", "added", "delta", "done", "completed"]
+        );
     }
 
     const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";
